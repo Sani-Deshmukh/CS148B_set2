@@ -10,6 +10,7 @@ from typing import Literal
 
 import torch
 from basics.model import BasicsTransformerLM
+import torch.cuda.nvtx as nvtx
 
 
 @dataclass(frozen=True)
@@ -91,22 +92,38 @@ def run_single_step(
     mode: Literal["forward", "forward-backward", "train-step"],
     autocast_context,
 ) -> None:
-    """Run a single forward/backward/train step on the model with the given batch."""
+
     if mode == "forward":
         with torch.no_grad():
+            nvtx.range_push("forward")
             with autocast_context:
                 model(batch)
+            nvtx.range_pop()
+
     elif mode == "forward-backward":
         model.zero_grad(set_to_none=True)
+
+        # FORWARD
+        nvtx.range_push("forward")
         with autocast_context:
             output = model(batch)
             loss = output.sum()
+        nvtx.range_pop()
+
+        # BACKWARD
+        nvtx.range_push("backward")
         loss.backward()
+        nvtx.range_pop()
+
     elif mode == "train-step":
         raise NotImplementedError("train-step mode is not needed for Section 2.3 yet.")
+
     else:
         raise ValueError(f"Unsupported benchmark mode: {mode}")
+
     torch.cuda.synchronize()
+    
+    
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
