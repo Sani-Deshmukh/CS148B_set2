@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import statistics
+import timeit
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import torch
+from basics.model import BasicsTransformerLM
 
 
 @dataclass(frozen=True)
@@ -57,12 +60,29 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def build_model(config: BenchmarkConfig) -> torch.nn.Module:
     """Instantiate the staff Basics transformer for the requested model size."""
-    raise NotImplementedError
+    model_spec = MODEL_SPECS[config.model_size]
+    model = BasicsTransformerLM(
+        vocab_size=config.vocab_size,
+        context_length=config.context_length,
+        d_model=model_spec.d_model,
+        num_layers=model_spec.num_layers,
+        num_heads=model_spec.num_heads,
+        d_ff=model_spec.d_ff,
+        rope_theta=10_000.0,
+    )
+    return model.to(torch.device("cuda"))
 
 
 def make_random_batch(config: BenchmarkConfig, device: torch.device) -> torch.Tensor:
     """Construct a random token batch for benchmarking and profiling."""
-    raise NotImplementedError
+    return torch.randint(
+        low=0,
+        high=config.vocab_size,
+        size=(config.batch_size, config.context_length),
+        device=device,
+        dtype=torch.long,
+    )
+    
 
 
 def run_single_step(
@@ -71,13 +91,69 @@ def run_single_step(
     mode: Literal["forward", "forward-backward", "train-step"],
     autocast_context,
 ) -> None:
-    """Execute one benchmark step and synchronize CUDA before returning."""
-    raise NotImplementedError
-
+    """Run a single forward/backward/train step on the model with the given batch."""
+    if mode == "forward":
+        with torch.no_grad():
+            with autocast_context:
+                model(batch)
+    elif mode == "forward-backward":
+        model.zero_grad(set_to_none=True)
+        with autocast_context:
+            output = model(batch)
+            loss = output.sum()
+        loss.backward()
+    elif mode == "train-step":
+        raise NotImplementedError("train-step mode is not needed for Section 2.3 yet.")
+    else:
+        raise ValueError(f"Unsupported benchmark mode: {mode}")
+    torch.cuda.synchronize()
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
-    raise NotImplementedError
+    device = torch.device("cuda")
+    model = build_model(config)
+    if config.compile_model:
+        model = torch.compile(model)
+
+    if config.mode == "forward":
+        model.eval()
+    else:
+        model.train()
+
+    batch = make_random_batch(config, device)
+    timings: list[float] = []
+
+    for _ in range(config.warmup_steps):
+        run_single_step(
+            model=model,
+            batch=batch,
+            mode=config.mode,
+            autocast_context=make_autocast_context(config.use_bf16),
+        )
+
+    for _ in range(config.measure_steps):
+        start_time = timeit.default_timer()
+        run_single_step(
+            model=model,
+            batch=batch,
+            mode=config.mode,
+            autocast_context=make_autocast_context(config.use_bf16),
+        )
+        elapsed_time = timeit.default_timer() - start_time
+        timings.append(elapsed_time)
+
+    mean_time = statistics.mean(timings)
+    std_time = statistics.stdev(timings) if len(timings) > 1 else 0.0
+    results = {
+        "mean_seconds": mean_time,
+        "std_seconds": std_time,
+        "num_steps": float(config.measure_steps),
+    }
+    print(
+        f"model_size={config.model_size} mode={config.mode} "
+        f"mean={mean_time:.6f}s std={std_time:.6f}s"
+    )
+    return results
 
 
 def annotated_scaled_dot_product_attention(*args, **kwargs):
