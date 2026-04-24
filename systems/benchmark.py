@@ -128,6 +128,9 @@ def run_single_step(
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
     device = torch.device("cuda")
+    if config.use_bf16 and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("BF16 benchmarking requested, but this CUDA device does not support BF16.")
+
     model = build_model(config)
     if config.compile_model:
         model = torch.compile(model)
@@ -139,13 +142,15 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
 
     batch = make_random_batch(config, device)
     timings: list[float] = []
+    autocast_context = make_autocast_context(config.use_bf16)
+    precision = "bf16" if config.use_bf16 else "fp32"
 
     for _ in range(config.warmup_steps):
         run_single_step(
             model=model,
             batch=batch,
             mode=config.mode,
-            autocast_context=make_autocast_context(config.use_bf16),
+            autocast_context=autocast_context,
         )
 
     for _ in range(config.measure_steps):
@@ -154,7 +159,7 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
             model=model,
             batch=batch,
             mode=config.mode,
-            autocast_context=make_autocast_context(config.use_bf16),
+            autocast_context=autocast_context,
         )
         elapsed_time = timeit.default_timer() - start_time
         timings.append(elapsed_time)
@@ -165,9 +170,10 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
         "mean_seconds": mean_time,
         "std_seconds": std_time,
         "num_steps": float(config.measure_steps),
+        "precision": precision,
     }
     print(
-        f"model_size={config.model_size} mode={config.mode} "
+        f"model_size={config.model_size} mode={config.mode} precision={precision} "
         f"mean={mean_time:.6f}s std={std_time:.6f}s"
     )
     return results
