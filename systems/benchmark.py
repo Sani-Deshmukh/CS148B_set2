@@ -10,6 +10,7 @@ from typing import Literal
 
 import torch
 from basics.model import BasicsTransformerLM
+from basics.optimizer import AdamW
 import torch.cuda.nvtx as nvtx
 
 
@@ -91,6 +92,7 @@ def run_single_step(
     batch: torch.Tensor,
     mode: Literal["forward", "forward-backward", "train-step"],
     autocast_context,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
 
     if mode == "forward":
@@ -116,7 +118,24 @@ def run_single_step(
         nvtx.range_pop()
 
     elif mode == "train-step":
-        raise NotImplementedError("train-step mode is not needed for Section 2.3 yet.")
+        if optimizer is None:
+            raise ValueError("train-step mode requires an optimizer.")
+
+        optimizer.zero_grad(set_to_none=True)
+
+        nvtx.range_push("forward")
+        with autocast_context:
+            output = model(batch)
+            loss = output.sum()
+        nvtx.range_pop()
+
+        nvtx.range_push("backward")
+        loss.backward()
+        nvtx.range_pop()
+
+        nvtx.range_push("optimizer-step")
+        optimizer.step()
+        nvtx.range_pop()
 
     else:
         raise ValueError(f"Unsupported benchmark mode: {mode}")
@@ -144,6 +163,7 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     timings: list[float] = []
     autocast_context = make_autocast_context(config.use_bf16)
     precision = "bf16" if config.use_bf16 else "fp32"
+    optimizer = AdamW(model.parameters(), lr=1e-3) if config.mode == "train-step" else None
 
     for _ in range(config.warmup_steps):
         run_single_step(
@@ -151,6 +171,7 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
             batch=batch,
             mode=config.mode,
             autocast_context=autocast_context,
+            optimizer=optimizer,
         )
 
     maybe_start_memory_history(config.use_memory_profiler)
@@ -162,6 +183,7 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
             batch=batch,
             mode=config.mode,
             autocast_context=autocast_context,
+            optimizer=optimizer,
         )
         elapsed_time = timeit.default_timer() - start_time
         timings.append(elapsed_time)
