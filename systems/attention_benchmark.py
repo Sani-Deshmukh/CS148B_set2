@@ -12,6 +12,7 @@ class AttentionBenchmarkConfig:
     head_dims: tuple[int, ...] = (16, 32, 64, 128)
     sequence_lengths: tuple[int, ...] = (64, 128, 256, 512, 1024)
     batch_size: int = 8
+    warmup_passes: int = 5
     forward_passes: int = 100
     backward_passes: int = 100
     compile_attention: bool = False
@@ -42,10 +43,11 @@ def benchmark_attention_once(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    warmup_passes: int,
     forward_passes: int,
     backward_passes: int,
     compile_attention: bool,
-) -> dict[str, float]:
+) -> dict[str, float | int]:
     """Time the forward and backward pass for a single attention configuration."""
     def attention_fn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         softmax = torch.nn.Softmax(dim=-1)
@@ -56,6 +58,15 @@ def benchmark_attention_once(
 
     forward_times = []
     backward_times = []
+
+    for _ in range(warmup_passes):
+        q.grad = None
+        k.grad = None
+        v.grad = None
+        output = attention_fn(q, k, v)
+        loss = output.sum()
+        loss.backward()
+        torch.cuda.synchronize()
 
     for _ in range(forward_passes):
         q.grad = None
@@ -69,6 +80,14 @@ def benchmark_attention_once(
         end_event.record()
         torch.cuda.synchronize()
         forward_times.append(start_event.elapsed_time(end_event))
+
+    q.grad = None
+    k.grad = None
+    v.grad = None
+    torch.cuda.reset_peak_memory_stats()
+    output = attention_fn(q, k, v)
+    torch.cuda.synchronize()
+    memory_before_backward_bytes = torch.cuda.memory_allocated()
 
     for _ in range(backward_passes):
         q.grad = None
@@ -88,6 +107,7 @@ def benchmark_attention_once(
     return {
         "forward_time_ms": sum(forward_times) / len(forward_times),
         "backward_time_ms": sum(backward_times) / len(backward_times),
+        "memory_before_backward_bytes": memory_before_backward_bytes,
     }
 
 
@@ -97,21 +117,33 @@ def benchmark_attention_grid(config: AttentionBenchmarkConfig) -> list[dict[str,
     results = []
     device = torch.device("cuda")
     for head_dim, sequence_length in iter_benchmark_shapes(config):
-        q, k, v = make_qkv(config.batch_size, sequence_length, head_dim, device)
-        result = benchmark_attention_once(
-            q,
-            k,
-            v,
-            forward_passes=config.forward_passes,
-            backward_passes=config.backward_passes,
-            compile_attention=config.compile_attention,
-        )
-        results.append({
-            "head_dim": head_dim,
-            "sequence_length": sequence_length,
-            "compiled": str(config.compile_attention),
-            **result,
-        })
+        try:
+            q, k, v = make_qkv(config.batch_size, sequence_length, head_dim, device)
+            result = benchmark_attention_once(
+                q,
+                k,
+                v,
+                warmup_passes=config.warmup_passes,
+                forward_passes=config.forward_passes,
+                backward_passes=config.backward_passes,
+                compile_attention=config.compile_attention,
+            )
+            row = {
+                "head_dim": head_dim,
+                "sequence_length": sequence_length,
+                "compiled": str(config.compile_attention),
+                **result,
+            }
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            row = {
+                "head_dim": head_dim,
+                "sequence_length": sequence_length,
+                "compiled": str(config.compile_attention),
+                "oom": "true",
+            }
+        results.append(row)
+        print(row)
     return results
 
 
