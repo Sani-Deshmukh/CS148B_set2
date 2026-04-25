@@ -153,6 +153,8 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
             autocast_context=autocast_context,
         )
 
+    maybe_start_memory_history(config.use_memory_profiler)
+
     for _ in range(config.measure_steps):
         start_time = timeit.default_timer()
         run_single_step(
@@ -163,6 +165,11 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
         )
         elapsed_time = timeit.default_timer() - start_time
         timings.append(elapsed_time)
+
+    maybe_dump_memory_snapshot(
+        config.use_memory_profiler,
+        config.output_dir / "memory_snapshot.pickle",
+    )
 
     mean_time = statistics.mean(timings)
     std_time = statistics.stdev(timings) if len(timings) > 1 else 0.0
@@ -186,12 +193,14 @@ def annotated_scaled_dot_product_attention(*args, **kwargs):
 
 def maybe_start_memory_history(enabled: bool) -> None:
     if enabled:
-        raise NotImplementedError
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
 
 
 def maybe_dump_memory_snapshot(enabled: bool, output_path: Path) -> None:
     if enabled:
-        raise NotImplementedError
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.cuda.memory._dump_snapshot(str(output_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def make_autocast_context(use_bf16: bool):
