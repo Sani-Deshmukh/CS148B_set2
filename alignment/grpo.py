@@ -13,7 +13,60 @@ def tokenize_prompt_and_output(
     tokenizer,
 ) -> dict[str, Tensor]:
     """Tokenize prompt/output pairs and build a response mask over the labels."""
-    raise NotImplementedError
+    if len(prompt_strs) != len(output_strs):
+        raise ValueError("prompt_strs and output_strs must have the same length")
+
+    prompt_token_ids = [
+        tokenizer.encode(prompt, add_special_tokens=False) for prompt in prompt_strs
+    ]
+    output_token_ids = [
+        tokenizer.encode(output, add_special_tokens=False) for output in output_strs
+    ]
+    full_sequences = [
+        prompt_ids + output_ids
+        for prompt_ids, output_ids in zip(prompt_token_ids, output_token_ids, strict=True)
+    ]
+
+    if not full_sequences:
+        return {
+            "input_ids": torch.empty((0, 0), dtype=torch.long),
+            "labels": torch.empty((0, 0), dtype=torch.long),
+            "response_mask": torch.empty((0, 0), dtype=torch.bool),
+        }
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("tokenizer must define pad_token_id or eos_token_id")
+
+    max_len = max(len(sequence) - 1 for sequence in full_sequences)
+    input_ids: list[list[int]] = []
+    labels: list[list[int]] = []
+    response_mask: list[list[bool]] = []
+
+    for prompt_ids, output_ids, sequence in zip(
+        prompt_token_ids,
+        output_token_ids,
+        full_sequences,
+        strict=True,
+    ):
+        sequence_len = len(sequence) - 1
+        padding_len = max_len - sequence_len
+
+        input_ids.append(sequence[:-1] + [pad_token_id] * padding_len)
+        labels.append(sequence[1:] + [pad_token_id] * padding_len)
+        response_mask.append(
+            [False] * (len(prompt_ids) - 1)
+            + [True] * len(output_ids)
+            + [False] * padding_len
+        )
+
+    return {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+        "response_mask": torch.tensor(response_mask, dtype=torch.bool),
+    }
 
 
 def compute_entropy(logits: Tensor) -> Tensor:
