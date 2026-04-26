@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .prompts import COT_PROMPT_TEMPLATE, DIRECT_PROMPT_TEMPLATE
-from .rewards import answer_tag_reward_fn, majority_vote_tagged_answers
+from .rewards import (
+    answer_tag_reward_fn,
+    extract_answer_from_tags,
+    majority_vote_tagged_answers,
+)
 
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Math-1.5B"
@@ -176,19 +180,21 @@ def run_direct_baseline(output_path: Path, split: str = "test") -> None:
     write_evaluation_results(results, output_path)
 
 
-def run_cot_baseline(output_path: Path) -> None:
+def run_cot_baseline(output_path: Path, split: str = "test") -> None:
     """Evaluate the chain-of-thought baseline from Section 3.2."""
     from vllm import SamplingParams
 
-    examples = load_gsm8k_examples("test")
+    examples = load_gsm8k_examples(split)
     prompts = build_prompts(examples, str(COT_PROMPT_TEMPLATE))
     ground_truths = [_extract_gsm8k_target(example) for example in examples]
 
     llm = load_vllm_model()
     sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=512,
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
         stop=["</answer>"],
+        include_stop_str_in_output=True,
     )
     results = evaluate_vllm(
         llm,
@@ -197,41 +203,63 @@ def run_cot_baseline(output_path: Path) -> None:
         sampling_params,
         ground_truths=ground_truths,
     )
+    results["split"] = split
+    results["category_summary"] = summarize_evaluation_results(results)
     write_evaluation_results(results, output_path)
 
 
-def run_self_consistency_baseline(output_path: Path, k: int = 5) -> None:
+def run_self_consistency_baseline(output_path: Path, k: int = 5, split: str = "test") -> None:
     """Evaluate the self-consistency baseline from Section 3.2."""
     from vllm import SamplingParams
 
-    examples = load_gsm8k_examples("test")
+    examples = load_gsm8k_examples(split)
     prompts = build_prompts(examples, str(COT_PROMPT_TEMPLATE))
     ground_truths = [_extract_gsm8k_target(example) for example in examples]
 
     llm = load_vllm_model()
     sampling_params = SamplingParams(
-        temperature=0.7,
-        top_p=0.95,
-        max_tokens=512,
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
         n=k,
         stop=["</answer>"],
+        include_stop_str_in_output=True,
     )
 
     generations = llm.generate(prompts, sampling_params)
     scored_examples: list[dict[str, Any]] = []
-    total_reward = 0.0
+    aggregate_scores: dict[str, float] = {}
+    tie_count = 0
 
     for prompt, generation, ground_truth in zip(prompts, generations, ground_truths, strict=True):
         responses = [candidate.text for candidate in generation.outputs]
+        answers = [
+            answer for answer in (extract_answer_from_tags(response) for response in responses)
+            if answer is not None
+        ]
+        answer_counts = Counter(answers)
         voted_answer = majority_vote_tagged_answers(responses)
         final_response = f"<answer>{voted_answer}</answer>" if voted_answer is not None else ""
         scores = answer_tag_reward_fn(final_response, ground_truth)
-        total_reward += scores["reward"]
+
+        if answer_counts:
+            top_count = answer_counts.most_common(1)[0][1]
+            is_tie = sum(count == top_count for count in answer_counts.values()) > 1
+            tie_count += int(is_tie)
+        else:
+            is_tie = False
+
+        for key, value in scores.items():
+            aggregate_scores[key] = aggregate_scores.get(key, 0.0) + float(value)
+
         scored_examples.append(
             {
                 "prompt": prompt,
                 "responses": responses,
+                "answer_counts": dict(answer_counts),
                 "majority_answer": voted_answer,
+                "is_tie": is_tie,
+                "num_unique_answers": len(answer_counts),
                 "ground_truth": ground_truth,
                 "scores": scores,
             }
@@ -240,10 +268,24 @@ def run_self_consistency_baseline(output_path: Path, k: int = 5) -> None:
     results = {
         "num_examples": len(scored_examples),
         "average_scores": {
-            "reward": total_reward / len(scored_examples) if scored_examples else 0.0,
+            key: value / len(scored_examples)
+            for key, value in aggregate_scores.items()
+        },
+        "self_consistency": {
+            "k": k,
+            "split": split,
+            "num_ties": tie_count,
+            "tie_rate": tie_count / len(scored_examples) if scored_examples else 0.0,
+            "average_num_unique_answers": (
+                sum(example["num_unique_answers"] for example in scored_examples)
+                / len(scored_examples)
+                if scored_examples
+                else 0.0
+            ),
         },
         "examples": scored_examples,
     }
+    results["category_summary"] = summarize_evaluation_results(results)
     write_evaluation_results(results, output_path)
 
 
@@ -255,7 +297,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run GSM8K vLLM evaluation baselines.")
     parser.add_argument(
         "--baseline",
-        choices=["direct"],
+        choices=["direct", "cot", "self_consistency"],
         default="direct",
         help="Which baseline to run.",
     )
@@ -271,10 +313,20 @@ def main() -> None:
         default=Path("artifacts/direct_baseline.json"),
         help="Path to write JSON results.",
     )
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=5,
+        help="Number of samples for self-consistency.",
+    )
     args = parser.parse_args()
 
     if args.baseline == "direct":
         run_direct_baseline(args.output, split=args.split)
+    elif args.baseline == "cot":
+        run_cot_baseline(args.output, split=args.split)
+    elif args.baseline == "self_consistency":
+        run_self_consistency_baseline(args.output, k=args.k, split=args.split)
 
 
 if __name__ == "__main__":
