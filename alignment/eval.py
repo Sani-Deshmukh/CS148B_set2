@@ -11,6 +11,20 @@ from .rewards import answer_tag_reward_fn, majority_vote_tagged_answers
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-Math-1.5B"
 DEFAULT_VALIDATION_SIZE = 256
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.65
+DEFAULT_MAX_NUM_SEQS = 8
+
+
+def load_vllm_model(model_name: str = DEFAULT_MODEL_NAME):
+    """Load a vLLM model with conservative defaults for Colab GPUs."""
+    from vllm import LLM
+
+    return LLM(
+        model=model_name,
+        gpu_memory_utilization=DEFAULT_GPU_MEMORY_UTILIZATION,
+        max_num_seqs=DEFAULT_MAX_NUM_SEQS,
+        enforce_eager=True,
+    )
 
 
 def _extract_gsm8k_target(example: dict[str, Any]) -> str:
@@ -101,17 +115,18 @@ def write_evaluation_results(results: dict[str, Any], output_path: Path) -> None
 
 def run_direct_baseline(output_path: Path) -> None:
     """Evaluate the direct-prediction GSM8K baseline from Section 3.1."""
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
 
     examples = load_gsm8k_examples("test")
     prompts = build_prompts(examples, DIRECT_PROMPT_TEMPLATE)
     ground_truths = [_extract_gsm8k_target(example) for example in examples]
 
-    llm = LLM(model=DEFAULT_MODEL_NAME)
+    llm = load_vllm_model()
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=128,
         stop=["</answer>"],
+        include_stop_str_in_output=True,
     )
     results = evaluate_vllm(
         llm,
@@ -125,13 +140,13 @@ def run_direct_baseline(output_path: Path) -> None:
 
 def run_cot_baseline(output_path: Path) -> None:
     """Evaluate the chain-of-thought baseline from Section 3.2."""
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
 
     examples = load_gsm8k_examples("test")
     prompts = build_prompts(examples, str(COT_PROMPT_TEMPLATE))
     ground_truths = [_extract_gsm8k_target(example) for example in examples]
 
-    llm = LLM(model=DEFAULT_MODEL_NAME)
+    llm = load_vllm_model()
     sampling_params = SamplingParams(
         temperature=0.0,
         max_tokens=512,
@@ -149,13 +164,13 @@ def run_cot_baseline(output_path: Path) -> None:
 
 def run_self_consistency_baseline(output_path: Path, k: int = 5) -> None:
     """Evaluate the self-consistency baseline from Section 3.2."""
-    from vllm import LLM, SamplingParams
+    from vllm import SamplingParams
 
     examples = load_gsm8k_examples("test")
     prompts = build_prompts(examples, str(COT_PROMPT_TEMPLATE))
     ground_truths = [_extract_gsm8k_target(example) for example in examples]
 
-    llm = LLM(model=DEFAULT_MODEL_NAME)
+    llm = load_vllm_model()
     sampling_params = SamplingParams(
         temperature=0.7,
         top_p=0.95,
