@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Sequence
+import argparse
 import json
 from pathlib import Path
 from typing import Any
@@ -113,18 +115,52 @@ def write_evaluation_results(results: dict[str, Any], output_path: Path) -> None
         json.dump(results, f, indent=2)
 
 
-def run_direct_baseline(output_path: Path) -> None:
+def _score_category(scores: dict[str, float]) -> str:
+    format_reward = float(scores.get("format_reward", 0.0))
+    answer_reward = float(scores.get("answer_reward", 0.0))
+    if format_reward == 1.0 and answer_reward == 1.0:
+        return "correct_format_and_answer"
+    if format_reward == 1.0 and answer_reward == 0.0:
+        return "formatted_wrong_answer"
+    if format_reward == 0.0 and answer_reward == 0.0:
+        return "unformatted"
+    return "other"
+
+
+def summarize_evaluation_results(
+    results: dict[str, Any],
+    examples_per_category: int = 10,
+) -> dict[str, Any]:
+    """Count reward categories and keep a few examples for qualitative analysis."""
+    counts: Counter[str] = Counter()
+    examples_by_category: dict[str, list[dict[str, Any]]] = {}
+
+    for example in results["examples"]:
+        category = _score_category(example["scores"])
+        counts[category] += 1
+        category_examples = examples_by_category.setdefault(category, [])
+        if len(category_examples) < examples_per_category:
+            category_examples.append(example)
+
+    return {
+        "category_counts": dict(counts),
+        "examples_by_category": examples_by_category,
+    }
+
+
+def run_direct_baseline(output_path: Path, split: str = "test") -> None:
     """Evaluate the direct-prediction GSM8K baseline from Section 3.1."""
     from vllm import SamplingParams
 
-    examples = load_gsm8k_examples("test")
+    examples = load_gsm8k_examples(split)
     prompts = build_prompts(examples, DIRECT_PROMPT_TEMPLATE)
     ground_truths = [_extract_gsm8k_target(example) for example in examples]
 
     llm = load_vllm_model()
     sampling_params = SamplingParams(
-        temperature=0.0,
-        max_tokens=128,
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=1024,
         stop=["</answer>"],
         include_stop_str_in_output=True,
     )
@@ -135,6 +171,8 @@ def run_direct_baseline(output_path: Path) -> None:
         sampling_params,
         ground_truths=ground_truths,
     )
+    results["split"] = split
+    results["category_summary"] = summarize_evaluation_results(results)
     write_evaluation_results(results, output_path)
 
 
@@ -211,3 +249,33 @@ def run_self_consistency_baseline(output_path: Path, k: int = 5) -> None:
 
 def get_prompt_template(use_cot: bool) -> str:
     return COT_PROMPT_TEMPLATE if use_cot else DIRECT_PROMPT_TEMPLATE
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run GSM8K vLLM evaluation baselines.")
+    parser.add_argument(
+        "--baseline",
+        choices=["direct"],
+        default="direct",
+        help="Which baseline to run.",
+    )
+    parser.add_argument(
+        "--split",
+        choices=["train", "test", "validation"],
+        default="test",
+        help="GSM8K split to evaluate.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("artifacts/direct_baseline.json"),
+        help="Path to write JSON results.",
+    )
+    args = parser.parse_args()
+
+    if args.baseline == "direct":
+        run_direct_baseline(args.output, split=args.split)
+
+
+if __name__ == "__main__":
+    main()
